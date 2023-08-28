@@ -10,11 +10,13 @@ from typing import AsyncGenerator, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import uvicorn
-from fastapi import BackgroundTasks, Request
+from fastapi import Depends,BackgroundTasks, Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from packaging import version
+from pydantic import BaseSettings
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -44,6 +46,44 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds
 logger = init_logger(__name__)
 served_model = None
 app = fastapi.FastAPI()
+get_bearer_token = HTTPBearer(auto_error=False)
+
+class AppSettings(BaseSettings):
+    # The address of the model controller.
+    api_keys: Optional[List[str]] = None
+
+app_settings = AppSettings()
+
+
+async def check_api_key(
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(get_bearer_token),
+) -> str:
+    if app_settings.api_keys:
+        if auth is None or (token := auth.credentials) not in app_settings.api_keys:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": {
+                        "message": "",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": "invalid_api_key",
+                    }
+                },
+            )
+        return token
+    else:
+        # api_keys not set; allow all
+        return None
+
+async def check_model(request) -> Optional[JSONResponse]:
+    if request.model == served_model:
+        return
+    ret = create_error_response(
+        HTTPStatus.NOT_FOUND,
+        f"The model `{request.model}` does not exist.",
+    )
+    return ret
 
 
 def create_error_response(status_code: HTTPStatus,
@@ -56,16 +96,6 @@ def create_error_response(status_code: HTTPStatus,
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):  # pylint: disable=unused-argument
     return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
-
-
-async def check_model(request) -> Optional[JSONResponse]:
-    if request.model == served_model:
-        return
-    ret = create_error_response(
-        HTTPStatus.NOT_FOUND,
-        f"The model `{request.model}` does not exist.",
-    )
-    return ret
 
 
 async def get_gen_prompt(request) -> str:
@@ -142,7 +172,7 @@ async def check_length(
         return input_ids, None
 
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(check_api_key)])
 async def show_available_models():
     """Show available models. Right now we only have one model."""
     model_cards = [
@@ -177,7 +207,7 @@ def create_logprobs(token_ids: List[int],
     return logprobs
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(check_api_key)])
 async def create_chat_completion(raw_request: Request):
     """Completion API similar to OpenAI's API.
 
@@ -347,7 +377,7 @@ async def create_chat_completion(raw_request: Request):
     return response
 
 
-@app.post("/v1/completions")
+@app.post("/v1/completions", dependencies=[Depends(check_api_key)])
 async def create_completion(raw_request: Request):
     """Completion API similar to OpenAI's API.
 
@@ -601,6 +631,9 @@ if __name__ == "__main__":
                         help="The model name used in the API. If not "
                         "specified, the model name will be the same as "
                         "the huggingface name.")
+    parser.add_argument("--api-keys",
+                        type=lambda s: s.split(","),
+                        help="Optional list of comma separated API keys")
 
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
@@ -612,6 +645,8 @@ if __name__ == "__main__":
         allow_methods=args.allowed_methods,
         allow_headers=args.allowed_headers,
     )
+
+    app_settings.api_keys = args.api_keys
 
     logger.info(f"args: {args}")
 
